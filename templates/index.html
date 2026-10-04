@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SQLite 事务隔离实验室</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <header>
+    <h1>SQLite 事务隔离实验室<small>WAL 模式 · BEGIN DEFERRED · 单行整数值 100</small></h1>
+    <div class="exp-bar">
+      <span>实验 ID：<code id="exp-id">…</code></span>
+      <button id="new-exp" type="button">新建实验</button>
+      <span class="spacer"></span>
+      <span>已提交值（第三条连接）：<strong id="committed" class="committed-value">…</strong></span>
+      <button id="refresh-committed" type="button">刷新</button>
+    </div>
+  </header>
+
+  <main>
+    <section class="panel" id="panel-a">
+      <h2>连接甲（A）</h2>
+      <div class="status-line">
+        <span class="dot" id="dot-a"></span>
+        <span>事务：<b id="tx-a">…</b></span>
+        <span>最近一次显式读值：<b id="read-a" class="read-value">—</b></span>
+      </div>
+      <div class="controls">
+        <button type="button" data-op="begin">BEGIN DEFERRED</button>
+        <button type="button" data-op="read">读值</button>
+        <span class="add-group">
+          <input type="text" inputmode="numeric" pattern="[+-]?[0-9]+" value="10" id="add-input-a" aria-label="要加上的整数" autocomplete="off">
+          <button type="button" data-op="add">加上</button>
+        </span>
+        <button type="button" data-op="commit">提交</button>
+        <button type="button" data-op="rollback">回滚</button>
+      </div>
+      <div class="error-box" id="error-a" hidden></div>
+      <ol class="log" id="log-a"></ol>
+    </section>
+
+    <section class="panel" id="panel-b">
+      <h2>连接乙（B）</h2>
+      <div class="status-line">
+        <span class="dot" id="dot-b"></span>
+        <span>事务：<b id="tx-b">…</b></span>
+        <span>最近一次显式读值：<b id="read-b" class="read-value">—</b></span>
+      </div>
+      <div class="controls">
+        <button type="button" data-op="begin">BEGIN DEFERRED</button>
+        <button type="button" data-op="read">读值</button>
+        <span class="add-group">
+          <input type="text" inputmode="numeric" pattern="[+-]?[0-9]+" value="10" id="add-input-b" aria-label="要加上的整数" autocomplete="off">
+          <button type="button" data-op="add">加上</button>
+        </span>
+        <button type="button" data-op="commit">提交</button>
+        <button type="button" data-op="rollback">回滚</button>
+      </div>
+      <div class="error-box" id="error-b" hidden></div>
+      <ol class="log" id="log-b"></ol>
+    </section>
+  </main>
+
+  <footer>
+    <p>说明：状态刷新不执行任何 SELECT，不会为 DEFERRED 事务提前建立快照；写锁冲突会立即返回
+       SQLite 错误名与错误码，不阻塞另一栏，也不会自动结束失败的事务；修改操作只允许在事务内进行。</p>
+  </footer>
+
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
