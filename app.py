@@ -2,8 +2,10 @@
 
 每个实验对应一个独立的 WAL 数据库（单行整数值 100）。
 页面左右两栏（甲 / 乙）各绑定一条长期独立连接，事务完全由显式 SQL 控制；
-第三条连接只读已提交值。状态刷新不执行任何 SELECT，
-避免在 DEFERRED 事务中提前建立读快照。
+第三条连接只读已提交值。状态刷新不执行任何 SELECT；写入前的溢出边界检查
+在事务尚未建立读快照时也走第三条连接，均不在两栏连接上提前建立读快照，
+从而保证未显式读值的事务在写锁冲突后、对端提交释放锁时，可在原事务中
+直接重试写入（而不是被误报 SQLITE_BUSY_SNAPSHOT）。
 """
 
 import os
@@ -80,6 +82,10 @@ class Experiment:
         # busy_timeout=0 让写锁冲突立即报错而不是等待。
         self.conns = {"a": self._open_conn(), "b": self._open_conn()}
         self.conn_locks = {"a": threading.Lock(), "b": threading.Lock()}
+        # 本事务是否已建立读快照：仅显式读值或首次成功写入会建立。
+        # 内部边界检查不得提前建立读快照，否则未读值的写操作在对端提交后
+        # 重试会被误判为 SQLITE_BUSY_SNAPSHOT(517)。
+        self.snapshot_taken = {"a": False, "b": False}
         # 第三条连接：只读已提交值
         self.observer = self._open_conn()
         self.observer_lock = threading.Lock()
@@ -144,40 +150,78 @@ def run_op(exp, side, op, value):
                 if conn.in_transaction:
                     return reject("事务已开启，不能重复 BEGIN")
                 conn.execute("BEGIN DEFERRED")
+                exp.snapshot_taken[side] = False
                 panel.add_log("BEGIN DEFERRED → 成功，事务已开启")
             elif op == "read":
                 row = conn.execute("SELECT val FROM kv WHERE id = 1").fetchone()
                 panel.last_read = row[0]
+                # 显式读值（以及随后的写入）会让本事务固定在当前读快照上
+                exp.snapshot_taken[side] = conn.in_transaction
                 scope = "事务内" if conn.in_transaction else "事务外（自动提交）"
                 panel.add_log("读值（%s）→ %s" % (scope, row[0]))
             elif op == "add":
                 if not conn.in_transaction:
                     return reject("禁止事务外修改：请先 BEGIN DEFERRED")
-                # 先在本事务内读出当前值，在 Python 中做精确边界检查：
-                # SQLite 对 64 位整数溢出不会报错，而是静默存成 REAL。
-                # 拒绝只影响本次操作，事务保持开启，仍可提交或回滚。
-                current = conn.execute(
-                    "SELECT val FROM kv WHERE id = 1"
-                ).fetchone()[0]
+                # SQLite 对 64 位整数溢出不会报错，而是静默存成 REAL，
+                # 因此在写入前做精确边界检查；拒绝只影响本次操作，事务保持开启。
+                # 关键：边界检查不得在本连接上执行 SELECT —— 未显式读值的
+                # DEFERRED 事务此时还没有读快照，一旦内部 SELECT 提前建立快照，
+                # 对端在此期间提交后，原事务重试写入就会被误报
+                # SQLITE_BUSY_SNAPSHOT(517)。
+                if exp.snapshot_taken[side]:
+                    # 已有读快照（用户显式读值或此前写入成功）：在事务内读取，
+                    # 与旧行为一致——包含本事务此前未提交的修改。
+                    current = conn.execute(
+                        "SELECT val FROM kv WHERE id = 1"
+                    ).fetchone()[0]
+                else:
+                    # 尚无读快照：用第三条（只读已提交值）连接取数，
+                    # 绝不在本连接建立读快照；随后的 UPDATE 若拿到写锁，
+                    # 会自然建立一份包含对端最新提交的全新快照。
+                    with exp.observer_lock:
+                        current = exp.observer.execute(
+                            "SELECT val FROM kv WHERE id = 1"
+                        ).fetchone()[0]
                 if not INT64_MIN <= current + value <= INT64_MAX:
                     return reject("累加结果超出有符号 64 位整数范围，本次未修改")
-                conn.execute("UPDATE kv SET val = val + ? WHERE id = 1", (value,))
+                # 以原子的单条 UPDATE 完成边界守卫与写入：WHERE 不匹配时
+                # SET 表达式不会被求值，不会产生 REAL；拿不到写锁则直接
+                # 返回 SQLITE_BUSY(5)，且失败的写入不保留读快照，对端提交后
+                # 可在同一事务中立即重试成功。
+                if value >= 0:
+                    cur = conn.execute(
+                        "UPDATE kv SET val = val + ? "
+                        "WHERE id = 1 AND val <= ?",
+                        (value, INT64_MAX - value),
+                    )
+                else:
+                    cur = conn.execute(
+                        "UPDATE kv SET val = val + ? "
+                        "WHERE id = 1 AND val >= ?",
+                        (value, INT64_MIN - value),
+                    )
+                if cur.rowcount == 0:
+                    return reject("累加结果超出有符号 64 位整数范围，本次未修改")
+                exp.snapshot_taken[side] = True
                 panel.add_log("加上 %s → 成功（尚未提交）" % value)
             elif op == "commit":
                 if not conn.in_transaction:
                     return reject("当前没有开启的事务")
                 conn.execute("COMMIT")
+                exp.snapshot_taken[side] = False
                 panel.add_log("COMMIT → 成功，事务已提交")
             elif op == "rollback":
                 if not conn.in_transaction:
                     return reject("当前没有开启的事务")
                 conn.execute("ROLLBACK")
+                exp.snapshot_taken[side] = False
                 panel.add_log("ROLLBACK → 成功，事务已回滚")
             else:
                 return reject("未知操作：%s" % op)
         except sqlite3.Error as exc:
             # 写锁冲突等 SQLite 错误：如实上报错误名与错误码，
             # 不做任何自动回滚，失败的事务保持开启。
+            # 拿锁失败的写入没有建立读快照，snapshot_taken 保持原值。
             name = getattr(exc, "sqlite_errorname", None) or "SQLITE_ERROR"
             code = getattr(exc, "sqlite_errorcode", None)
             panel.add_log("%s → 失败 [%s (%s)] %s" % (label, name, code, exc))
